@@ -14,7 +14,7 @@ Usage:
     python deidentify.py INPUT.txt --map crosswalk.json   # ALSO write reversible token->value map (SENSITIVE)
     python deidentify.py INPUT.txt --json                 # print machine-readable result to stdout
 
-Exit codes: 0 = success, 2 = usage error.
+Exit codes: 0 = success, 2 = usage error, 3 = guard failure when --strict is set.
 """
 from __future__ import annotations
 
@@ -98,11 +98,23 @@ REGEX_DETECTORS = [
     ("EMAIL", re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
     ("URL", re.compile(r"\bhttps?://[^\s<>\"')]+", re.I)),
     ("IP", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    # SSN — dashed, spaced, or labelled (the label form also catches 9 straight
+    # digits, e.g. "SSN 123456789"). A bare, unlabelled 9-digit run is NOT
+    # force-matched here (too many false positives); it surfaces instead via the
+    # long-number review net below.
     ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+    ("SSN", re.compile(r"\b\d{3}[ \t]\d{2}[ \t]\d{4}\b")),
+    ("SSN", re.compile(r"\b(?:SSN|Social\s+Security(?:\s+(?:No\.?|Number|#))?)\s*[:#]?\s*(\d{3}[- \t]?\d{2}[- \t]?\d{4})\b", re.I)),
     # MRN: labeled medical record number OR "MRN" token followed by digits.
     ("MRN", re.compile(r"\b(?:MRN|Medical\s+Record\s+(?:No\.?|Number|#))\s*[:#]?\s*([A-Z0-9\-]{4,})\b", re.I)),
     ("FAX", re.compile(r"\bfax\s*[:#]?\s*(\+?\d[\d\-().\s]{7,}\d)\b", re.I)),
+    # Phone: (a) the strict US shape (area code + separators), (b) any number
+    # with a leading + country code, and (c) a number that follows a phone label
+    # (catches run-together 10-digit and international formats the strict pattern
+    # misses). Whitespace is limited to spaces/tabs so a match never spans lines.
     ("PHONE", re.compile(r"(?<!\d)(?:\+?1[\s.\-]?)?(?:\(\d{3}\)|\d{3})[\s.\-]\d{3}[\s.\-]\d{4}(?!\d)")),
+    ("PHONE", re.compile(r"(?<!\w)\+\d[\d().\-\t ]{6,}\d(?!\w)")),
+    ("PHONE", re.compile(r"\b(?:phone|tel|telephone|mobile|cell|call|contact)\s*(?:no\.?|number|#)?\s*[:#]?\s*(\+?\d[\d().\-\t ]{6,}\d)", re.I)),
     ("TIME", re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b")),
     ("VIN", re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")),
     # Device / serial / certificate / license numbers when explicitly labeled.
@@ -394,6 +406,21 @@ def find_unknown_cap_spans(text: str) -> list:
     return spans
 
 
+# Long bare digit runs (>=7) that carried no label the detectors could anchor
+# on — e.g. an unlabelled account / record / SSN / device or phone number.
+_LONG_NUM_RE = re.compile(r"(?<!\w)\d{7,}(?!\w)")
+
+
+def find_unknown_number_spans(text: str) -> list:
+    """Long unlabelled digit sequences that look like an identifier but weren't
+    matched by any structured detector. Flagged for human review so a silent
+    miss becomes a review item instead of a leak; never auto-redacted (a bare
+    number can be a legitimate non-PHI value, so a human confirms)."""
+    return [Span(m.start(), m.end(), "NUM", m.group(0), "unknown-number",
+                 confidence="review", flag_only=True)
+            for m in _LONG_NUM_RE.finditer(text)]
+
+
 def _all_spans(text, model=None, flag_unknown=False, redact_unknown=False):
     """Gather every candidate span for a free-text segment (all stages)."""
     spans = find_regex_spans(text) + find_geo_spans(text) + find_name_spans(text)
@@ -404,12 +431,21 @@ def _all_spans(text, model=None, flag_unknown=False, redact_unknown=False):
 
     if flag_unknown or redact_unknown:
         occupied = [(s.start, s.end) for s in real]
+
+        def _free(u):
+            return not any(u.start < e and st < u.end for st, e in occupied)
+
         for u in find_unknown_cap_spans(text):
-            if any(u.start < e and st < u.end for st, e in occupied):
+            if not _free(u):
                 continue
             if redact_unknown:
                 u.flag_only = False
             real.append(u)
+        # Long unlabelled numbers are always flagged-only (redact_unknown is
+        # name-specific): surface them for review without corrupting real data.
+        for u in find_unknown_number_spans(text):
+            if _free(u):
+                real.append(u)
     return real
 
 
@@ -517,11 +553,20 @@ class _Redactor:
         red = "".join(out)
         for s in (s for s in spans if s.flag_only):     # flagged, not redacted
             self.detectors.add(s.detector)
+            if s.detector == "unknown-number":
+                reason = ("unlabelled long digit run — confirm whether it is an "
+                          "identifier (account / record / SSN / device / phone) "
+                          "to redact")
+            elif s.label == "ORG":
+                reason = ("organisation / facility name candidate — not an "
+                          "individual identifier; confirm before sharing")
+            else:
+                reason = ("unrecognised capitalised name-like text was NOT "
+                          "auto-redacted — a human must confirm/redact it")
             self.review.append({
                 "token": None, "label": s.label, "detector": s.detector,
                 "value_hash": _hash(s.value, self.salt),
-                "reason": ("unrecognised capitalised name-like text was NOT "
-                           "auto-redacted — a human must confirm/redact it")})
+                "reason": reason})
         self.released.append(red)
         return red
 
@@ -612,6 +657,7 @@ def _notes(detectors) -> list:
     used_model = "model" in detectors
     used_field = "field" in detectors
     used_unknown = "unknown" in detectors
+    used_unknown_num = "unknown-number" in detectors
     notes = [
         "Structured identifiers (SSN, MRN, phone, fax, email, URL, IP, dates, "
         "ZIP, street/city-state, account/license/device numbers) are matched "
@@ -636,6 +682,12 @@ def _notes(detectors) -> list:
             "Unrecognised capitalised name-like text was FLAGGED under "
             "needs_human_review but NOT auto-redacted, so silent misses surface "
             "for a human instead of leaking.")
+    if used_unknown_num:
+        notes.append(
+            "Long unlabelled digit sequences (>=7 digits) that resemble an "
+            "account / record / SSN / device or phone number were FLAGGED under "
+            "needs_human_review but NOT auto-redacted — confirm whether each is "
+            "an identifier to remove.")
     notes.append(
         "A qualified human must review before release. This tool does not, on "
         "its own, satisfy the Safe Harbor 'no actual knowledge' clause "

@@ -115,9 +115,16 @@ re-written per agent.
 Handled **deterministically by regex** (high confidence): names in labelled
 fields and after titles, street addresses, city + state, geographic ZIP
 (truncated to 3 digits; restricted prefixes zeroed), all date elements finer
-than year, ages 90+ (aggregated), phone, fax, email, URL, IP address, SSN, MRN,
-health-plan / account / member numbers, certificate / license / DEA / NPI
-numbers, device serial numbers, VIN.
+than year, ages 90+ (aggregated), phone (US, international `+country-code`, and
+labelled formats), fax, email, URL, IP address, SSN (dashed, spaced, or
+labelled — including run-together digits), MRN, health-plan / account / member
+numbers, certificate / license / DEA / NPI numbers, device serial numbers, VIN.
+
+As a backstop, any **unlabelled digit run of 7+ characters** that looks like an
+identifier the structured detectors couldn't anchor on (a bare account / record
+/ SSN / device or phone number) is **flagged under `needs_human_review`** — never
+silently dropped, and never auto-redacted (a bare number may be a legitimate
+non-PHI value, so a human confirms).
 
 Handled **best-effort** and flagged for review: person names in free prose.
 Names are caught by (a) title/label patterns ("Patient: …", "Dr. …") and (b) a
