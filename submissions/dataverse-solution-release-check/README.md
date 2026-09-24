@@ -13,7 +13,7 @@ tells you:
 |---|---|---|
 | Missing dependencies | Components from your own publisher that the solution needs but doesn't contain. Components from other solutions that the target must already have. | Blocker or prerequisite |
 | Table packaging | Your own tables packaged with root component behavior 1 or 2 rather than 0; fine only if the target already has the table | Warning |
-| Code components on forms | A form uses one of your PCF controls, but the control isn't in the package and no other solution is named for it | Blocker |
+| Code components on forms | A form uses one of your PCF controls, but the control isn't fully in the package (its `Controls` folder, `<CustomControls>` entry and solution component) and no other solution is named for it. A packaged control manifest that isn't valid or that the check can't read. | Blocker (a warning for such a manifest when another solution is named for the control, or when the control isn't yours and isn't used in `customizations.xml` or declared in the package) |
 | PCF platform libraries | React or Fluent versions declared outside the range Microsoft allows | Blocker |
 | Development builds | Control bundles built in development mode. Those contain `eval()`, which Solution checker rates Critical ([rules table](https://learn.microsoft.com/power-apps/maker/data-platform/use-powerapps-checker#best-practice-rules-used-by-solution-checker)). | Warning |
 | Site map icons | An SVG in `Icon` with no `VectorIcon`. An icon that points at a web resource the package doesn't include. | Warning |
@@ -37,7 +37,8 @@ tells you:
   usual wrong files: unpacked source (`pac solution unpack`) or a folder, Solution checker
   results (the SARIF file an enforcement results link downloads, a zip of SARIF reports from the
   checker API or PowerShell module, or the Excel report zip from **Download results** in Power
-  Apps), and a zip of zips.
+  Apps), and a zip of zips. A zip with duplicate entries (the same name twice, ignoring case)
+  isn't checked, because the check can't tell which copy counts.
 - **Give the agent the zip.**
   - **Cowork:** attach the zip with **Upload images and files**, or pick it from OneDrive or
     SharePoint with **Attach cloud files**. Cowork can't read files stored on your device, and
@@ -165,7 +166,10 @@ the import will succeed.
   about 30 times for crafted XML made of tiny elements; with these caps, crafted packages
   stayed under 500 MB in our tests. The parser refuses XML with a DOCTYPE, and every entry is
   read back once (up to 256 MiB) so damaged files are reported. What a limit stops is listed
-  under "Not checked", or reported as too large for the check.
+  under "Not checked", or reported as too large for the check. The exception is a code
+  component's `ControlManifest.xml` that a limit for one file or the DOCTYPE rule stops: that
+  is reported as `control-manifest-invalid`, because the check then can't confirm the control
+  is packaged.
 
 ## How it differs from Microsoft's tools and similar skills
 

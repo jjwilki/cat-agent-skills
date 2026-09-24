@@ -15,8 +15,8 @@ already have) and **checklist** (a step a person takes before, during or after t
 - **Ids:** `not-a-zip`, `file-not-found`, `folder`, `not-a-solution`, `unpacked-source`,
   `yaml-source`, `nested-folder`, `zip-in-zip`, `solution-xml-unparseable`,
   `customizations-xml-unparseable`, `solution-xml-doctype`, `customizations-xml-doctype`,
-  `customizations-xml-missing`, `too-many-entries`, `too-large`, `unreadable-entry`,
-  `internal-error`.
+  `customizations-xml-missing`, `too-many-entries`, `duplicate-entries`, `too-large`,
+  `unreadable-entry`, `internal-error`.
 - **Looks for:** a zip with `solution.xml` at its root whose root element is `<ImportExportXml>`
   containing `<SolutionManifest>`, plus `customizations.xml`. It recognises the usual wrong
   uploads: Solution checker results (a bare SARIF file, recognised by a `.sarif` name or SARIF's
@@ -32,6 +32,17 @@ already have) and **checklist** (a step a person takes before, during or after t
   check doesn't read it. `*-unparseable` means the XML isn't well-formed. `unreadable-entry`
   means `solution.xml` or `customizations.xml` fails its checksum, is truncated or can't be
   decompressed.
+- **Duplicates:** the check looks entries up by name, compared without case, with backslashes
+  read as slashes and any leading slash removed. `duplicate-entries` means two or more entries
+  name the same path (up to 10 are listed). For this, names are also compared with empty and
+  `.` path segments ignored, `..` applied, and trailing spaces and dots removed, so
+  `./solution.xml` or `Controls/<name>//ControlManifest.xml` counts as a second copy. The
+  package is ambiguous: the check can't tell which copy counts, so it checks nothing rather
+  than silently reading one. This applies to any entry, not only `solution.xml` and
+  `customizations.xml`. It is checked once `solution.xml` is found at the zip root, after the
+  wrong-upload checks above, so Solution checker results or a zip of zips with repeated names
+  are still recognised as such. None of the real exports we've seen has a duplicate name.
+  Don't say what an import would do with the duplicates.
 - **Size:** `too-large` means the export may be valid but is too large for this offline check:
   a file read into memory is over 64 MiB, expands more than 50 times (above 8 MiB), or would take
   the run past the 128 MiB it reads into memory in total; `solution.xml` or `customizations.xml`
@@ -129,29 +140,61 @@ already have) and **checklist** (a step a person takes before, during or after t
 
 ## 4. Code components on forms
 
-- **Ids:** `form-control-not-packaged` (blocker), `control-packaging-inconsistent` (warning).
+- **Ids:** `form-control-not-packaged` (blocker), `control-manifest-invalid` (blocker, or
+  warning as below), `control-packaging-inconsistent` (warning).
 - **Looks for:** every form `<customControl name="...">` whose name has the publisher prefix
-  (`<prefix>_<Namespace>.<Constructor>`). A used control with no
-  `Controls/<name>/ControlManifest.xml` is a blocker, unless `solution.xml` lists it as a type
-  66 missing dependency from another named solution: then it is only a prerequisite. The title
-  says the control "isn't in the package" when none of its three places below is present, and
-  "isn't fully packaged" when some are; the evidence lists each as present or missing. In exports
-  we've seen, each packaged control appears in three places: the `Controls/<name>/` folder, the
-  `<CustomControls><CustomControl><Name>` entry and a `RootComponent type="66"`. Any other owned
-  control present in only one or two of them is `control-packaging-inconsistent`.
-  If `<CustomControls>` names a manifest file that's missing, `package-file-missing` (check 8)
-  also reports it. Controls from Microsoft
-  (`MscrmControls.*`, `Microsoft.PowerApps.*`) are ignored here; they surface as prerequisites.
-  When the same control is also an owned type 66 missing dependency, it is reported once.
+  (`<prefix>_<Namespace>.<Constructor>`). In exports we've seen, each packaged control appears
+  in three places: the `Controls/<name>/` folder with its `ControlManifest.xml`, the
+  `<CustomControls><CustomControl><Name>` entry and a `RootComponent type="66"`. A used control
+  counts as packaged only when all three are present and its manifest passes the check below,
+  or wasn't read because the run's total read or parse limit was reached (see below).
+  Otherwise it is a blocker, unless `solution.xml` lists it as a type 66 missing dependency from
+  another named solution: then it is only a prerequisite (a packaged manifest for it that fails
+  the check is still `control-manifest-invalid`, as a warning). The title says the control
+  "isn't in the package" when none of the three is present, and "isn't fully packaged" when
+  some are; the evidence lists each as present or missing. A used control with the folder but
+  no `<CustomControls>` entry or no type 66 root is this blocker, not
+  `control-packaging-inconsistent`. Any other owned control present in only one or two of the
+  three places is `control-packaging-inconsistent`, unless its manifest fails the check: then
+  it is reported only as `control-manifest-invalid`, with the other two places in the evidence.
+- **Manifests:** each packaged `Controls/<name>/ControlManifest.xml` is read once, before the
+  form check, and reused by checks 5 and 8. It must be well-formed XML with a `<manifest>` root
+  holding a `<control>` element that has `namespace` and `constructor` attributes. That is the
+  shape Learn's manifest schema reference gives, and every exported manifest we've seen has it.
+  A manifest that isn't well-formed or has another shape, or that the check refuses (a DOCTYPE,
+  or over a limit for one file: 64 MiB, expanding more than 50 times above 8 MiB, or more than
+  200,000 elements plus attributes), is `control-manifest-invalid`. It is a warning when
+  `solution.xml` lists the control as a type 66 missing dependency from another named solution,
+  or when the control isn't used anywhere in `customizations.xml`, has no `<CustomControls>`
+  entry or type 66 root, and doesn't carry the publisher prefix (a stray folder). Otherwise it
+  is a blocker. That control doesn't count as packaged, and checks 5 and 8 skip its manifest.
+  If a used control also misses one of the three places, it is reported once, as
+  `form-control-not-packaged`, with the manifest problem in the evidence. A refused manifest may
+  be valid, but it is reported like an invalid one, because the check then can't confirm the
+  control is packaged. A manifest that can't be read back from the zip is reported once, as
+  `package-entry-damaged` (check 8). One that wasn't read because the run's total read or
+  parse limit was reached first is different: the check never looked at that file, so it is
+  listed under "Not checked" and the control isn't flagged. That line says when the control is
+  used in `customizations.xml`, because the check then couldn't confirm it is packaged.
+- **Also:** if `<CustomControls>` names a manifest file that's missing, `package-file-missing`
+  (check 8) also reports it. Controls from Microsoft (`MscrmControls.*`,
+  `Microsoft.PowerApps.*`) are ignored here; they surface as prerequisites. When the same
+  control is also an owned type 66 missing dependency, it is reported once, as the blocker
+  here. A `control-manifest-invalid` warning never absorbs that missing-dependency blocker:
+  both are reported.
 - **Why:** the form needs the component in the target. Learn: dependencies on code components
   from another solution are listed as type 66 missing dependencies, and that solution must be
-  installed in the target first. The three-places layout is observed, not documented. Learn
-  lists a few supported edits to the `customizations.xml` of an exported unmanaged solution
-  (ribbon, site map, FormXml, saved queries and ISV.config); defining other components by
-  editing it isn't supported. That is why a partly packaged control points to a hand-edited zip.
+  installed in the target first. The three-places layout is observed, not documented. Learn's
+  manifest schema reference gives the manifest one `<control>` element and makes its `namespace`
+  and `constructor` attributes required. Learn lists a few supported edits to the
+  `customizations.xml` of an exported unmanaged solution (ribbon, site map, FormXml, saved
+  queries and ISV.config); defining other components by editing it isn't supported. That is why
+  a partly packaged control points to a hand-edited zip.
 - **Fix:** add the code component to the solution and export again, or install its solution
   first. Don't edit the zip by hand.
 - **Sources:** https://learn.microsoft.com/power-apps/developer/component-framework/code-components-alm ;
+  https://learn.microsoft.com/power-apps/developer/component-framework/manifest-schema-reference/manifest ;
+  https://learn.microsoft.com/power-apps/developer/component-framework/manifest-schema-reference/control ;
   https://learn.microsoft.com/power-platform/alm/dependency-tracking-solution-components ;
   https://learn.microsoft.com/power-apps/developer/data-platform/supported-customizations#unsupported-customizations ;
   https://learn.microsoft.com/power-platform/alm/when-edit-customization-file
@@ -160,7 +203,8 @@ already have) and **checklist** (a step a person takes before, during or after t
 
 - **Ids:** `platform-library-version` (blocker), `platform-library-unknown`,
   `pcf-built-with-old-pac` (warnings).
-- **Looks for:** `<platform-library name version>` in each packaged `ControlManifest.xml`.
+- **Looks for:** `<platform-library name version>` in each packaged `ControlManifest.xml` that
+  passes the manifest check in check 4.
   Allowed version range on 2026-09-23: React `16.14.0`; Fluent `8.29.0`, `8.121.1`, or `9.4.0`
   to `9.46.2`. Fluent 8 and Fluent 9 can't both be specified in one manifest. The versions
   Learn lists as loaded at runtime (React 17.0.2 in model-driven apps, Fluent 9.68.0) are
@@ -223,9 +267,9 @@ already have) and **checklist** (a step a person takes before, during or after t
 - **Ids:** `package-file-missing`, `package-entry-damaged` (blockers).
 - **Looks for:** `FileName`, `JsonFileName` and `XamlFileName` paths in `customizations.xml`
   (web resources, code components, plug-in assemblies, processes and flows), and the `code`,
-  `css`, `resx` and `img` paths in each packaged `ControlManifest.xml` (relative to its
-  `Controls/<name>/` folder), that aren't in the zip. Separately, every entry is read back once
-  in chunks; an entry that fails its checksum, is truncated, or can't be decompressed is
+  `css`, `resx` and `img` paths in each packaged `ControlManifest.xml` that passes the manifest
+  check in check 4 (relative to its `Controls/<name>/` folder), that aren't in the zip.
+  Separately, every entry is read back once in chunks; an entry that fails its checksum, is truncated, or can't be decompressed is
   `package-entry-damaged`, reported once rather than under "Not checked". That read-back stops
   after 256 MiB and skips an entry that expands more than 50 times (above 8 MiB); entries it
   skips are listed under "Not checked" as not read back.

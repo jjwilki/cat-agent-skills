@@ -81,6 +81,10 @@ LEARN = {
                       "code-components-best-practices#power-apps-component-framework",
     "platform_library_element": "https://learn.microsoft.com/power-apps/developer/component-framework/"
                                 "manifest-schema-reference/platform-library",
+    "pcf_manifest": "https://learn.microsoft.com/power-apps/developer/component-framework/"
+                    "manifest-schema-reference/manifest",
+    "pcf_control_element": "https://learn.microsoft.com/power-apps/developer/component-framework/"
+                           "manifest-schema-reference/control",
     "checker_eval": "https://learn.microsoft.com/power-apps/maker/data-platform/"
                     "common-issues-resolutions-solution-checker#solution-checker-violations-reported-for-code-components",
     "checker_enforcement": "https://learn.microsoft.com/troubleshoot/power-platform/dataverse/"
@@ -177,7 +181,11 @@ class DoctypeRefused(ET.ParseError):
 
 
 class TooManyNodes(CheckSkipped):
-    """An XML file, or all XML files together, has more nodes than this check parses."""
+    """An XML file has more nodes than this check parses."""
+
+
+class OverBudget(CheckSkipped):
+    """The run's total read or parse budget is spent. The file itself may be fine."""
 
 
 # --------------------------------------------------------------------------- helpers
@@ -379,6 +387,22 @@ def may_have_namespaced_elements(data):
 ENTRY_ERRORS = (zlib.error, EOFError, zipfile.BadZipFile, NotImplementedError, RuntimeError, OSError, ValueError)
 
 
+def same_path(name):
+    """An entry name with spellings of the same path folded together, to spot duplicates: no
+    case, backslashes read as slashes, empty and "." segments dropped, ".." applied, and
+    trailing spaces and dots removed from each segment."""
+    out = []
+    for seg in name.replace("\\", "/").lower().split("/"):
+        if seg == "..":
+            if out:
+                out.pop()
+            continue
+        seg = seg.rstrip(" .")
+        if seg:
+            out.append(seg)
+    return "/".join(out)
+
+
 class Package:
     def __init__(self, path):
         self.path = path
@@ -389,11 +413,16 @@ class Package:
             raise PackageError("too-many-entries", "The zip has too many entries to check",
                                "%d entries (limit %d)." % (len(infos), MAX_MEMBERS))
         self.infos = {}
+        paths = {}   # same_path() form -> entry names as stored
         for i in infos:
             if i.filename.endswith("/"):
                 continue
             key = i.filename.replace("\\", "/").lstrip("/").lower()
+            paths.setdefault(same_path(i.filename), []).append(i.filename)
             self.infos.setdefault(key, i)
+        # Entries whose names point at the same path make the package ambiguous. load_solution()
+        # refuses it once solution.xml is found, so the wrong-upload checks run first.
+        self.duplicates = sorted((k, names) for k, names in paths.items() if len(names) > 1)
         declared = sum(i.file_size for i in self.infos.values())
         if declared > MAX_TOTAL_BYTES:
             raise PackageError("too-large", "The zip is too large for this offline check",
@@ -435,8 +464,8 @@ class Package:
     def xml(self, name, max_nodes=MAX_SMALL_XML_NODES):
         """Read and parse one XML entry within its own node cap and the run's total, so many
         small crafted files can't add up to more parsing than one large one."""
-        total = TooManyNodes("the package's XML files have more than %s elements and attributes in total, more "
-                             "than this check parses" % format(MAX_TOTAL_XML_NODES, ","))
+        total = OverBudget("the package's XML files have more than %s elements and attributes in total, more "
+                           "than this check parses" % format(MAX_TOTAL_XML_NODES, ","))
         left = MAX_TOTAL_XML_NODES - self.xml_nodes
         if left <= 0:
             raise total
@@ -476,8 +505,8 @@ class Package:
                                % (v(info.filename), fmt_size(info.compress_size), fmt_size(info.file_size),
                                   MAX_RATIO))
         if self.read_total + info.file_size > MAX_READ_BYTES:
-            raise CheckSkipped("%s wasn't read: this check reads at most %s of the package into memory in total"
-                               % (v(info.filename), fmt_size(MAX_READ_BYTES)))
+            raise OverBudget("%s wasn't read: this check reads at most %s of the package into memory in total"
+                             % (v(info.filename), fmt_size(MAX_READ_BYTES)))
         try:
             with self.zf.open(info) as f:
                 data = f.read(limit + 1)
@@ -549,14 +578,14 @@ class Context:
                 self.root_index.setdefault((r.get("type", ""), x), r)
         self.webresource_names = set(lc(text(kid(w, "Name")))
                                      for w in kids(kid(cust, "WebResources"), "WebResource"))
-        self.unpackaged_controls = {}   # lower name -> finding (for de-duplication)
+        self.unpackaged_controls = {}   # lower name -> blocker finding (for de-duplication)
         self.external_controls = set()  # type 66 identifiers another named solution provides
         self.packaged_missing = {}      # (type, key) -> {"root", "label", "entries"} for roots also listed missing
         self.owned_missing = {}         # lower identifier -> owned-missing-dependency finding
         self.prerequisite_ids = set()   # lower identifiers of components another named solution provides
         self.env = None                 # environment_variables() result, computed once
         self.conn_refs = None           # connection_references() result, computed once
-        self.manifest_files = {}        # manifest entry -> resource paths it names (parsed once)
+        self.control_manifests = None   # manifest_info() result, computed once
 
     def owned(self, name):
         n = lc(name)
@@ -711,9 +740,27 @@ def load_xml(pkg, name):
                            "%s: %s." % (e.__class__.__name__, v(e)), "Export the solution again and check the new .zip.")
 
 
+def duplicate_entries(pkg):
+    """Refuse a package whose entry names point at the same path more than once: every lookup
+    is by name, so a second copy would be silently ignored, and which copy counts is ambiguous."""
+    shown = ["%s (%d entries)" % (", ".join(head(dict.fromkeys(v(n) for n in names), 3)), len(names))
+             for _key, names in pkg.duplicates]
+    n = len(pkg.duplicates)
+    return PackageError("duplicate-entries", "The zip has duplicate entries, so it can't be checked reliably",
+                        "%d name%s appear%s more than once: %s. Names are compared without case, with backslashes "
+                        "read as slashes, empty and \".\" path segments ignored, \"..\" applied, and trailing spaces "
+                        "and dots removed. The package is ambiguous: the check can't tell which copy counts, so it "
+                        "doesn't check the package."
+                        % (n, "" if n == 1 else "s", "s" if n == 1 else "", "; ".join(head(shown, 10))),
+                        "Export the solution again and check the .zip the export produces, without editing or "
+                        "re-zipping it.")
+
+
 def load_solution(pkg, rep):
     if not pkg.has("solution.xml"):
         raise not_a_solution(pkg)
+    if pkg.duplicates:
+        raise duplicate_entries(pkg)
     root = load_xml(pkg, "solution.xml")
     manifest = kid(root, "SolutionManifest")
     if root.tag != "ImportExportXml" or manifest is None:
@@ -1052,9 +1099,79 @@ def form_control_usages(ctx):
     return usages
 
 
+def manifests(ctx):
+    """(entry key, control folder name as stored) for each Controls/<name>/ControlManifest.xml."""
+    for n in ctx.pkg.names():
+        parts = n.split("/")
+        if len(parts) == 3 and parts[0] == "controls" and parts[2] == "controlmanifest.xml":
+            yield n, ctx.pkg.original(n).split("/")[1]
+
+
+def manifest_file_paths(root):
+    """The code, css, resx and img paths a ControlManifest.xml names, relative to its folder."""
+    return [attr(el, "path") for tag in ("code", "css", "resx", "img") for el in root.iter(tag)]
+
+
+def manifest_problem(root):
+    """Why a parsed ControlManifest.xml doesn't have the shape Learn's manifest schema reference
+    gives (a <manifest> root holding a <control> with namespace and constructor), or ""."""
+    if lc(root.tag) != "manifest":
+        return "its root element is %s, not %s" % (v("<%s>" % root.tag), v("<manifest>"))
+    ctrls = kids(root, "control")
+    if not ctrls:
+        return "%s has no %s element" % (v("<manifest>"), v("<control>"))
+    missing = [a for a in ("namespace", "constructor") if not attr(ctrls[0], a)]
+    if missing:
+        return "its %s element has no %s attribute%s" % (v("<control>"), " or ".join(missing),
+                                                          "" if len(missing) == 1 else "s")
+    return ""
+
+
+def manifest_info(ctx):
+    """Every packaged Controls/<name>/ControlManifest.xml, read and validated once and cached on ctx,
+    as {lower-cased control name: info}. info["state"] is one of:
+      valid    well-formed, with the shape manifest_problem() checks (info["root"], info["control_el"])
+      invalid  not well-formed, or the wrong shape (info["reason"])
+      refused  a DOCTYPE, or this file alone is over a size or node limit (info["reason"])
+      damaged  can't be read back from the zip; reported once, as package-entry-damaged
+      budget   not read because the run's total read or parse budget was spent first; the file
+               itself may be fine, so it is listed under Not checked"""
+    if ctx.control_manifests is not None:
+        return ctx.control_manifests
+    out = {}
+    for key, control in manifests(ctx):
+        info = out[lc(control)] = {"key": key, "control": control, "path": ctx.pkg.original(key),
+                                   "state": "invalid", "reason": "", "root": None, "control_el": None}
+        try:
+            root = ctx.pkg.xml(key)
+        except DamagedEntry:
+            info["state"] = "damaged"
+            continue
+        except OverBudget as e:
+            info["state"], info["reason"] = "budget", str(e)
+            continue
+        except DoctypeRefused:
+            info["state"] = "refused"
+            info["reason"] = "it has a document type declaration (DOCTYPE), which this check refuses"
+            continue
+        except CheckSkipped as e:   # this file alone is over a size or node limit
+            info["state"], info["reason"] = "refused", str(e)
+            continue
+        except (ET.ParseError, UnicodeDecodeError, ValueError) as e:
+            info["reason"] = "it isn't well-formed XML (%s)" % v(e)
+            continue
+        problem = manifest_problem(root)
+        if problem:
+            info["reason"] = problem
+            continue
+        info.update(state="valid", root=root, control_el=kids(root, "control")[0])
+    ctx.control_manifests = out
+    return out
+
+
 def check_code_components(ctx, rep):
     folders = control_folders(ctx)
-    with_manifest = set(k for k, files in folders.items() if "controlmanifest.xml" in files)
+    mans = manifest_info(ctx)   # validated here, before the form check relies on it
     declared = {}
     for cc in kids(kid(ctx.cust, "CustomControls"), "CustomControl"):
         n = text(kid(cc, "Name"))
@@ -1063,38 +1180,117 @@ def check_code_components(ctx, rep):
     roots = dict((lc(r.get("schemaname")), r.get("schemaname")) for r in ctx.roots
                  if r.get("type") == "66" and r.get("schemaname"))
     usages = form_control_usages(ctx)
+    state = {True: "present", False: "missing"}
+
+    def places(key, name):
+        """The three places a packaged control appears, each present or missing."""
+        info = mans.get(key)
+        path = v("Controls/%s/ControlManifest.xml" % (info["control"] if info else name))
+        if info is None:
+            first = "%s missing%s" % (path, " (the folder has other files)" if key in folders else "")
+        elif info["state"] in ("invalid", "refused"):
+            first = "%s present, but %s" % (path, info["reason"])
+        else:
+            first = "%s present" % path
+        return [first, "%s entry %s" % (v("<CustomControls>"), state[key in declared]),
+                "RootComponent type 66 %s" % state[key in roots]]
+
     for key, u in sorted(usages.items()):
-        if not ctx.owned(u["name"]) or key in with_manifest or key in ctx.external_controls:
+        if not ctx.owned(u["name"]) or key in ctx.external_controls:
             # key in external_controls: solution.xml names another solution that provides it,
             # so it is listed under prerequisites instead.
             continue
-        state = {True: "present", False: "missing"}
-        parts = ["%s missing%s" % (v("Controls/%s/ControlManifest.xml" % u["name"]),
-                                   " (the folder has other files)" if key in folders else ""),
-                 "%s entry %s" % (v("<CustomControls>"), state[key in declared]),
-                 "RootComponent type 66 %s" % state[key in roots]]
+        if key in mans and key in declared and key in roots:
+            # In all three places. An unusable manifest is reported below, as a blocker; one the
+            # run's total read or parse limit stopped is listed under Not checked.
+            continue
         partly = key in folders or key in declared or key in roots
         rep.add("form-control-not-packaged", "blocker",
                 "Code component %s is used on a form but isn't %s" % (v(u["name"]),
                                                                       "fully packaged" if partly else "in the package"),
                 "Used on %s. In the package: %s. solution.xml names no other solution that provides it."
-                % ("; ".join(head(u["where"], 8)), "; ".join(parts)),
+                % ("; ".join(head(u["where"], 8)), "; ".join(places(key, u["name"]))),
                 "A form that binds a code component needs that component in the target. In exports we've seen, "
-                "a packaged code component has a %s folder with its ControlManifest.xml; this one doesn't, so a "
-                "clean target won't have it. Learn: when solutions depend on a code component solution, that "
-                "solution must be installed in the target first." % v("Controls/<name>/"),
+                "a packaged code component appears in three places: its %s folder with a ControlManifest.xml, a %s "
+                "entry in customizations.xml and a type 66 root component in solution.xml. %s Learn: when solutions "
+                "depend on a code component solution, that solution must be installed in the target first."
+                % (v("Controls/<name>/"), v("<CustomControls>"),
+                   "This one is missing from at least one of them, so the check doesn't count it as packaged."
+                   if partly else "This one is in none of them, so a clean target won't have it."),
                 "Add the code component to this solution and export again, or install the solution that "
                 "contains it in the target first.", [LEARN["pcf_alm"], LEARN["dependency_tracking"]],
                 component=u["name"], component_type="66")
         ctx.unpackaged_controls[key] = rep.findings[-1]
-    for key in sorted(set(with_manifest) | set(declared) | set(roots)):
-        if key in ctx.unpackaged_controls or not ctx.owned(key):
+    reported = set()   # controls whose manifest problem is reported below, at either severity
+    for key, info in mans.items():
+        u = usages.get(key)
+        if info["state"] == "budget":
+            rep.skipped("Code components on forms", "%s wasn't read (%s), so its shape, platform libraries and "
+                        "resource files weren't checked%s." % (
+                            v(info["path"]), info["reason"],
+                            ", and the check couldn't confirm that this code component, which is used in "
+                            "customizations.xml, is packaged" if u else ""))
+        if info["state"] not in ("invalid", "refused") or key in ctx.unpackaged_controls:
             continue
-        present = {"folder": key in with_manifest, "declared": key in declared, "root": key in roots}
+        owned = ctx.owned(info["control"])
+        external = key in ctx.external_controls
+        in_package = [p for p, present in (("a %s entry" % v("<CustomControls>"), key in declared),
+                                           ("a type 66 root component", key in roots)) if present]
+        if u:
+            where = "Used on %s." % "; ".join(head(u["where"], 8))
+        else:
+            where = "Not used in customizations.xml; %s this publisher's prefix." % (
+                "it carries" if owned else "it doesn't carry")
+        if external:
+            # solution.xml names another solution that provides this control (a prerequisite, as
+            # in the form check above), so the copy in this package is only a warning.
+            severity, reason = "warning", (
+                " solution.xml names another solution that provides this code component, so it is listed under "
+                "prerequisites and this is a warning.")
+        elif u:
+            severity, reason = "blocker", " A form that binds a code component needs that component in the target."
+        elif owned:
+            severity, reason = "blocker", (" It carries this publisher's prefix, so the check treats it as your own "
+                                           "component.")
+        elif in_package:
+            severity, reason = "blocker", (" The package also has %s for it, so the check treats it as part of this "
+                                           "package." % " and ".join(in_package))
+        else:
+            severity, reason = "warning", (
+                " It isn't used in customizations.xml, has no %s entry or type 66 root component, and doesn't carry "
+                "this publisher's prefix, so this is a warning." % v("<CustomControls>"))
+        rep.add("control-manifest-invalid", severity,
+                "Code component %s has %s" % (v(info["control"]), "an invalid ControlManifest.xml"
+                                              if info["state"] == "invalid" else
+                                              "a ControlManifest.xml this check can't read"),
+                "%s: %s. %s In the package: %s." % (v(info["path"]), info["reason"], where,
+                                                    "; ".join(places(key, info["control"])[1:])),
+                "Learn's manifest schema reference defines a code component's manifest as a %s element holding one "
+                "%s element, whose namespace and constructor attributes are required; the ControlManifest.xml files "
+                "in exports we've seen have that shape. %s, so it doesn't count the control as packaged, and the "
+                "platform-library and resource-file checks skip it.%s"
+                % (v("<manifest>"), v("<control>"),
+                   "The check can't confirm this one does" if info["state"] == "invalid" else
+                   "The check refuses to read this one (the file may still be valid) and can't confirm its shape",
+                   reason),
+                "Export the solution again and check the new .zip; don't edit the export by hand. " + (
+                    "Install the solution that provides this code component in the target first (see prerequisites)."
+                    if external else
+                    "If a new export has the same file, rebuild the code component and add it to the solution again."),
+                [LEARN["pcf_manifest"], LEARN["pcf_control_element"], LEARN["edit_customizations"]],
+                component=info["control"], component_type="66")
+        reported.add(key)
+        if severity == "blocker":
+            # merge_duplicates() folds an owned type 66 missing-dependency blocker into this one;
+            # a warning must never absorb a blocker.
+            ctx.unpackaged_controls[key] = rep.findings[-1]
+    for key in sorted(set(mans) | set(declared) | set(roots)):
+        if key in ctx.unpackaged_controls or key in reported or not ctx.owned(key):
+            continue
+        present = {"folder": key in mans, "declared": key in declared, "root": key in roots}
         if all(present.values()):
             continue
-        name = declared.get(key) or roots.get(key) or key
-        state = {True: "present", False: "missing"}
+        name = declared.get(key) or roots.get(key) or mans[key]["control"]
         desc = ["%s %s" % (v("Controls/%s/ControlManifest.xml" % name), state[present["folder"]]),
                 "%s entry %s" % (v("<CustomControls>"), state[present["declared"]]),
                 "RootComponent type 66 %s" % state[present["root"]]]
@@ -1128,30 +1324,11 @@ def version_allowed(lib, ver):
     return any(version_tuple(lo) <= t <= version_tuple(hi) for lo, hi in a["ranges"])
 
 
-def manifests(ctx):
-    for n in ctx.pkg.names():
-        parts = n.split("/")
-        if len(parts) == 3 and parts[0] == "controls" and parts[2] == "controlmanifest.xml":
-            yield n, ctx.pkg.original(n).split("/")[1]
-
-
-def manifest_file_paths(root):
-    """The code, css, resx and img paths a ControlManifest.xml names, relative to its folder."""
-    return [attr(el, "path") for tag in ("code", "css", "resx", "img") for el in root.iter(tag)]
-
-
 def check_platform_libraries(ctx, rep):
-    for key, control in manifests(ctx):
-        try:
-            root = ctx.pkg.xml(key)
-        except DamagedEntry:
-            continue    # reported once as package-entry-damaged
-        except (ET.ParseError, CheckSkipped, UnicodeDecodeError, ValueError) as e:
-            rep.skipped("PCF platform libraries", "%s could not be parsed (%s)." % (v(ctx.pkg.original(key)), v(e)))
-            continue
-        ctx.manifest_files[key] = manifest_file_paths(root)
-        ctrl = root if root.tag == "control" else next(root.iter("control"), None)
-        path = ctx.pkg.original(key)
+    for info in manifest_info(ctx).values():
+        if info["state"] != "valid":
+            continue    # reported by the code-component check, as package-entry-damaged, or under Not checked
+        root, ctrl, control, path = info["root"], info["control_el"], info["control"], info["path"]
         majors = set()
         for pl in root.iter("platform-library"):
             lib, ver = attr(pl, "name"), attr(pl, "version")
@@ -1338,18 +1515,14 @@ def check_package_files(ctx, rep):
     missing = ["%s %s: %s" % (kind, v(name), v(path)) for kind, name, path in refs if path and not ctx.pkg.has(path)]
     # Each packaged ControlManifest.xml names its own resources (code, css, resx, img),
     # relative to the control's folder.
-    for key, control in manifests(ctx):
-        paths = ctx.manifest_files.get(key)   # already parsed by the platform-library check
-        if paths is None:
-            try:
-                paths = manifest_file_paths(ctx.pkg.xml(key))
-            except (ET.ParseError, CheckSkipped, UnicodeDecodeError, ValueError):
-                continue    # reported by the platform-library check or as package-entry-damaged
-        folder = "Controls/%s/" % control
-        for raw in paths:
+    for info in manifest_info(ctx).values():   # parsed once, by the code-component check
+        if info["state"] != "valid":
+            continue    # reported by the code-component check, as package-entry-damaged, or under Not checked
+        folder = "Controls/%s/" % info["control"]
+        for raw in manifest_file_paths(info["root"]):
             p = re.sub(r"^(?:\./)+", "", raw.replace("\\", "/")).lstrip("/")
             if p and not ctx.pkg.has(folder + p):
-                missing.append("Code component %s: %s" % (v(control), v(folder + p)))
+                missing.append("Code component %s: %s" % (v(info["control"]), v(folder + p)))
     if missing:
         rep.add("package-file-missing", "blocker", "Files the package refers to are missing from the zip",
                 "Missing: %s." % "; ".join(head(missing, 15)),

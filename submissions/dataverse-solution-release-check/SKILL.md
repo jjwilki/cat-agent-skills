@@ -52,9 +52,10 @@ instead. `--output <path>` writes the report to a new file instead of printing i
 the working or outputs directory, never this skill's folder. It refuses to overwrite an
 existing file, so pick a new name.
 
-Exit codes: `0` no blockers, `1` blockers found, `2` not a solution export, unreadable, too
-large for the check, or a usage error such as an existing or unwritable `--output` file. A
-non-zero exit is a result, not a tool failure: read the report either way.
+Exit codes: `0` no blockers, `1` blockers found, `2` not a solution export, unreadable,
+ambiguous (duplicate entry names), too large for the check, or a usage error such as an
+existing or unwritable `--output` file. A non-zero exit is a result, not a tool failure: read
+the report either way.
 
 **Completion:** you have the report and the exit code.
 
@@ -66,9 +67,10 @@ name) and run it again.
 
 Otherwise, tell the user plainly that the file couldn't be checked. Give the reason from the
 report (for example Solution checker results, unpacked source or a folder, a zip inside a zip,
-or a damaged `solution.xml`) and its "What to do" line. If the reason is that a file is too
-large for this offline check, say the export may still be valid; don't call it unreadable.
-Don't guess at the contents.
+duplicate entries, or a damaged `solution.xml`) and its "What to do" line. If the reason is
+that a file is too large for this offline check, say the export may still be valid; don't call
+it unreadable. For duplicate entries, don't say what an import would do with them. Don't guess
+at the contents.
 
 ### 4. Present the results
 
