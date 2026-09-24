@@ -312,16 +312,20 @@ Derived from what the package contains. Values are never printed.
   connection references appear there and not as root components. Pick a connection for each,
   or supply them in a deployment settings file (`pac solution create-settings`, then
   `pac solution import --settings-file`); the import validates that the connections are owned
-  by, or shared with, the connection reference owner. `env-var-without-value`: definitions with
+  by, or shared with, the connection reference owner. A `connectionreferences/` file the check
+  can't read is listed in this item as a file to check by hand, and under Not checked, rather
+  than left out. `env-var-without-value`: definitions with
   no default value and no current value. Learn documents only that values ship as separate JSON
   files in the exported zip. The layout the check reads is observed in real exports:
   `environmentvariabledefinitions/<schemaname>/environmentvariabledefinition.xml` with
   `environmentvariablevalues.json` beside it (it also accepts an
-  `<EnvironmentVariableDefinitions>` element in `customizations.xml`). A values file that can't
-  be read (damaged, over 8 MiB, not JSON or nested too deeply) counts as a value and is noted
-  under Not checked. The import prompts only when neither the solution nor the target has a value.
-  Shipping no value is what Microsoft advises. A type 380 root with no recognisable definition
-  file is listed under Not checked. `enable-steps-and-flows-option`: "Enable Plugin steps and
+  `<EnvironmentVariableDefinitions>` element in `customizations.xml`). What the check can't read
+  is listed in this item too, marked to check by hand, and under Not checked: a definition with
+  no default whose values file can't be read (damaged, over 8 MiB, not JSON or nested too deeply;
+  whether it ships a value is unknown, so it isn't reported as shipping one), a definition file
+  that can't be parsed, and a type 380 root with no recognisable definition file. The import
+  prompts only when neither the solution nor the target has a value. Shipping no value is what
+  Microsoft advises. `enable-steps-and-flows-option`: "Enable Plugin steps and
   flows included in the solution" is on by default in the Power Apps import wizard. With
   `pac solution import` it is off unless you pass `--activate-plugins`; Pipelines in Power
   Platform activate by default. Without it, plug-in steps that arrive inactive stay inactive;

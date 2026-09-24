@@ -585,6 +585,9 @@ class Context:
         self.prerequisite_ids = set()   # lower identifiers of components another named solution provides
         self.env = None                 # environment_variables() result, computed once
         self.conn_refs = None           # connection_references() result, computed once
+        self.conn_ref_unreadable = []   # (entry name, reason) for connectionreferences/*.xml it couldn't read
+        self.env_unreadable_defs = []   # environment variable definition files it couldn't read
+        self.env_unmatched = []         # type 380 roots with no definition file it recognises
         self.control_manifests = None   # manifest_info() result, computed once
 
     def owned(self, name):
@@ -1646,7 +1649,10 @@ def connection_references(ctx):
         if n.startswith("connectionreferences/") and n.endswith(".xml"):
             try:
                 el = ctx.pkg.xml(n)
-            except (ET.ParseError, CheckSkipped, UnicodeDecodeError, ValueError):
+            except (ET.ParseError, CheckSkipped, UnicodeDecodeError, ValueError) as e:
+                # Kept, so the import checklist can say which files it couldn't read rather than
+                # silently leaving their connection references out.
+                ctx.conn_ref_unreadable.append((ctx.pkg.original(n), str(e)))
                 continue
             items = [el] if el.tag.lower() == "connectionreference" else list(el.iter("connectionreference"))
             for it in items:
@@ -1689,17 +1695,19 @@ def environment_variables(ctx):
         if not schema:
             return
         has_default = bool(text(kid(el, "defaultvalue")))
-        has_value = False
+        has_value, unreadable = False, False
         for f in value_files.get(folder, []) if folder else []:
             try:
                 has_value = has_value or _has_value_key(
                     json.loads(ctx.pkg.read(f, limit=MAX_JSON_BYTES).decode("utf-8-sig")))
             except Exception:   # damaged, too large, not JSON or nested too deeply
-                has_value = True
-                notes.append("The value file %s for %s could not be read; treated as having a value."
+                unreadable = True
+                notes.append("The value file %s for %s could not be read, so whether it ships a value is unknown."
                              % (v(ctx.pkg.original(f)), v(schema)))
         defs[lc(schema)] = {"name": schema, "display": attr(kid(el, "displayname"), "default"),
-                            "hasDefault": has_default, "hasCurrentValue": has_value}
+                            "hasDefault": has_default, "hasCurrentValue": has_value,
+                            # A value file that couldn't be read: neither "has a value" nor "has none".
+                            "valueUnknown": unreadable and not has_value}
 
     for n in names:
         if n.rsplit("/", 1)[-1] == "environmentvariabledefinition.xml":
@@ -1707,13 +1715,18 @@ def environment_variables(ctx):
                 el = ctx.pkg.xml(n)
             except Exception as e:   # damaged, too large or not well-formed
                 notes.append("%s could not be parsed (%s)." % (v(ctx.pkg.original(n)), v(e)))
+                ctx.env_unreadable_defs.append(ctx.pkg.original(n))
                 continue
             add(el, n.rsplit("/", 1)[0] if "/" in n else "")
     for holder in kids(ctx.cust, "EnvironmentVariableDefinitions"):
         for el in kids(holder, "environmentvariabledefinition"):
             add(el, "")
     listed = [r.get("schemaname") for r in ctx.roots if r.get("type") == "380" and r.get("schemaname")]
-    unmatched = [x for x in listed if lc(x) not in defs]
+    # A definition whose file couldn't be read is already listed by that file (its folder is named
+    # after the schema name), so don't list it again as having no file.
+    unreadable_folders = {lc(p.rsplit("/", 2)[-2]) for p in ctx.env_unreadable_defs if p.count("/") >= 1}
+    unmatched = [x for x in listed if lc(x) not in defs and lc(x) not in unreadable_folders]
+    ctx.env_unmatched = unmatched
     if unmatched:
         notes.append("%d environment variable definition%s listed in solution.xml (type 380) had no definition "
                      "file this check recognises: %s. Check their values by hand."
@@ -1781,12 +1794,17 @@ def check_import_checklist(ctx, rep):
                    [LEARN["import"]])
     # During import
     refs = connection_references(ctx)
-    if refs:
+    for path, why in ctx.conn_ref_unreadable:
+        rep.skipped("Connection references", "%s could not be read (%s); any connection reference it defines isn't "
+                    "listed in the import checklist." % (v(path), v(why)))
+    if refs or ctx.conn_ref_unreadable:
         rep.action("connection-reference-needs-connection", "during-import",
                    "Pick a connection for each connection reference",
                    ["%s (%s, connector %s)" % (v(r["name"]), v(r["display"]) if r["display"] else "no display name",
                                                   v(r["connector"]) if r["connector"] else "unknown")
-                    for r in sorted(refs.values(), key=lambda x: lc(x["name"]))],
+                    for r in sorted(refs.values(), key=lambda x: lc(x["name"]))] +
+                   ["%s (this check couldn't read the file: pick a connection for any connection reference it "
+                    "defines too)" % v(path) for path, _why in ctx.conn_ref_unreadable],
                    "The import asks for a connection for each connection reference, or lets you create one. Flows "
                    "that were on when exported should turn on during the import when their connection references get "
                    "connections. For automated imports, supply the connections in a deployment settings file (pac "
@@ -1796,14 +1814,23 @@ def check_import_checklist(ctx, rep):
     defs, notes = environment_variables(ctx)
     for note in notes:
         rep.skipped("Environment variables", note)
-    no_value = [d for d in defs.values() if not d["hasDefault"] and not d["hasCurrentValue"]]
-    if no_value:
+    no_value = [d for d in defs.values() if not d["hasDefault"] and not d["hasCurrentValue"] and not d["valueUnknown"]]
+    unknown = [d for d in defs.values() if not d["hasDefault"] and d["valueUnknown"]]
+    unread = (["%s%s (its value file couldn't be read: check whether it has a value)"
+               % (v(d["name"]), " (%s)" % v(d["display"]) if d["display"] else "")
+               for d in sorted(unknown, key=lambda x: lc(x["name"]))] +
+              ["%s (this check couldn't read the definition file: check this environment variable's value by hand)"
+               % v(p) for p in ctx.env_unreadable_defs] +
+              ["%s (listed in solution.xml, but no definition file this check recognises: check its value by hand)"
+               % v(x) for x in ctx.env_unmatched])
+    if no_value or unread:
         rep.action("env-var-without-value", "during-import", "Provide values for environment variables that have none",
                    ["%s%s" % (v(d["name"]), " (%s)" % v(d["display"]) if d["display"] else "")
-                    for d in sorted(no_value, key=lambda x: lc(x["name"]))],
+                    for d in sorted(no_value, key=lambda x: lc(x["name"]))] + unread,
                    "These definitions ship with no default value and no current value. The import prompts for a value "
                    "only when neither the solution nor the target has one; supply it at import or in the deployment "
-                   "settings file. Shipping definitions without values is what Microsoft advises, so this is expected.",
+                   "settings file. Shipping definitions without values is what Microsoft advises, so this is expected."
+                   + (" Items this check couldn't read are listed too, so check them by hand." if unread else ""),
                    [LEARN["env_vars"]])
     with_value = sorted(d["name"] for d in defs.values() if d["hasCurrentValue"])
     if with_value:
