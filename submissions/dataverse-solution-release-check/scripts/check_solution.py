@@ -1112,18 +1112,34 @@ def manifest_file_paths(root):
     return [attr(el, "path") for tag in ("code", "css", "resx", "img") for el in root.iter(tag)]
 
 
+# Attributes Learn's control element reference marks as required. description-key, control-type
+# and preview-image are optional there, so their absence isn't a problem.
+CONTROL_REQUIRED_ATTRS = ("namespace", "constructor", "version", "display-name-key")
+CONTROL_TYPES = ("standard", "virtual")
+
+
 def manifest_problem(root):
     """Why a parsed ControlManifest.xml doesn't have the shape Learn's manifest schema reference
-    gives (a <manifest> root holding a <control> with namespace and constructor), or ""."""
+    gives, or "": a <manifest> root holding a <control> with the required namespace, constructor,
+    version and display-name-key attributes, a control-type (if any) of standard or virtual, and
+    exactly one <resources> element."""
     if lc(root.tag) != "manifest":
         return "its root element is %s, not %s" % (v("<%s>" % root.tag), v("<manifest>"))
     ctrls = kids(root, "control")
     if not ctrls:
         return "%s has no %s element" % (v("<manifest>"), v("<control>"))
-    missing = [a for a in ("namespace", "constructor") if not attr(ctrls[0], a)]
+    ctrl = ctrls[0]
+    missing = [a for a in CONTROL_REQUIRED_ATTRS if not attr(ctrl, a)]
     if missing:
-        return "its %s element has no %s attribute%s" % (v("<control>"), " or ".join(missing),
-                                                          "" if len(missing) == 1 else "s")
+        return "its %s element has no %s attribute%s" % (
+            v("<control>"), ", ".join(missing[:-1]) + (" or " if len(missing) > 1 else "") + missing[-1],
+            "" if len(missing) == 1 else "s")
+    ctype = attr(ctrl, "control-type")
+    if ctype and lc(ctype) not in CONTROL_TYPES:
+        return "its %s control-type is %s, not standard or virtual" % (v("<control>"), v(ctype))
+    resources = len(kids(ctrl, "resources"))
+    if resources != 1:
+        return "its %s element has %d %s elements, not exactly one" % (v("<control>"), resources, v("<resources>"))
     return ""
 
 
@@ -1266,8 +1282,10 @@ def check_code_components(ctx, rep):
                 "%s: %s. %s In the package: %s." % (v(info["path"]), info["reason"], where,
                                                     "; ".join(places(key, info["control"])[1:])),
                 "Learn's manifest schema reference defines a code component's manifest as a %s element holding one "
-                "%s element, whose namespace and constructor attributes are required; the ControlManifest.xml files "
-                "in exports we've seen have that shape. %s, so it doesn't count the control as packaged, and the "
+                "%s element, whose namespace, constructor, version and display-name-key attributes are required, "
+                "whose control-type (if set) is standard or virtual, and which holds one resources element; the "
+                "ControlManifest.xml files in exports we've seen have that shape. %s, so it doesn't count the "
+                "control as packaged, and the "
                 "platform-library and resource-file checks skip it.%s"
                 % (v("<manifest>"), v("<control>"),
                    "The check can't confirm this one does" if info["state"] == "invalid" else
@@ -1886,6 +1904,16 @@ def analyse(path):
                                "solution.xml is present but customizations.xml is not, so the package can't be "
                                "imported and most checks can't run.", "Export the solution again.")
         cust = load_xml(pkg, "customizations.xml")
+        if cust.tag != "ImportExportXml":
+            # Like solution.xml, customizations.xml in an export has an <ImportExportXml> root. Anything
+            # else would leave every check with nothing to read and a misleading "No blockers found".
+            ctx = Context(pkg, sol_root, manifest, ET.Element("ImportExportXml"))
+            summarise(ctx, rep)
+            raise PackageError("not-a-solution", "customizations.xml is not a Dataverse customizations file",
+                               "Root element is %s; an export's customizations.xml has %s."
+                               % (v("<" + str(cust.tag) + ">"), v("<ImportExportXml>")),
+                               "Export the solution again from Power Apps or with pac solution export, and check "
+                               "the .zip that export produces without editing it.")
         ctx = Context(pkg, sol_root, manifest, cust)
         try:
             summarise(ctx, rep)

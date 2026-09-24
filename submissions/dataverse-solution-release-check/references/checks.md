@@ -18,7 +18,8 @@ already have) and **checklist** (a step a person takes before, during or after t
   `customizations-xml-missing`, `too-many-entries`, `duplicate-entries`, `too-large`,
   `unreadable-entry`, `internal-error`.
 - **Looks for:** a zip with `solution.xml` at its root whose root element is `<ImportExportXml>`
-  containing `<SolutionManifest>`, plus `customizations.xml`. It recognises the usual wrong
+  containing `<SolutionManifest>`, plus a `customizations.xml` whose root element is also
+  `<ImportExportXml>` (either one with another root is `not-a-solution`). It recognises the usual wrong
   uploads: Solution checker results (a bare SARIF file, recognised by a `.sarif` name or SARIF's
   JSON shape, which is what a Managed Environments enforcement results link downloads; a zip
   holding `.sarif` files, which is what the checker web API and PowerShell module return; or a
@@ -159,8 +160,11 @@ already have) and **checklist** (a step a person takes before, during or after t
   it is reported only as `control-manifest-invalid`, with the other two places in the evidence.
 - **Manifests:** each packaged `Controls/<name>/ControlManifest.xml` is read once, before the
   form check, and reused by checks 5 and 8. It must be well-formed XML with a `<manifest>` root
-  holding a `<control>` element that has `namespace` and `constructor` attributes. That is the
-  shape Learn's manifest schema reference gives, and every exported manifest we've seen has it.
+  holding a `<control>` element with the attributes Learn marks as required (`namespace`,
+  `constructor`, `version` and `display-name-key`), a `control-type` of `standard` or `virtual`
+  if it has one, and exactly one `<resources>` element. `description-key`, `control-type` and
+  `preview-image` are optional in Learn, so their absence isn't flagged. That is the shape
+  Learn's manifest schema reference gives, and every exported manifest we've seen has it.
   A manifest that isn't well-formed or has another shape, or that the check refuses (a DOCTYPE,
   or over a limit for one file: 64 MiB, expanding more than 50 times above 8 MiB, or more than
   200,000 elements plus attributes), is `control-manifest-invalid`. It is a warning when
@@ -185,8 +189,9 @@ already have) and **checklist** (a step a person takes before, during or after t
 - **Why:** the form needs the component in the target. Learn: dependencies on code components
   from another solution are listed as type 66 missing dependencies, and that solution must be
   installed in the target first. The three-places layout is observed, not documented. Learn's
-  manifest schema reference gives the manifest one `<control>` element and makes its `namespace`
-  and `constructor` attributes required. Learn lists a few supported edits to the
+  manifest schema reference gives the manifest one `<control>` element, makes its `namespace`,
+  `constructor`, `version` and `display-name-key` attributes required, and gives the control one
+  `<resources>` element. Learn lists a few supported edits to the
   `customizations.xml` of an exported unmanaged solution (ribbon, site map, FormXml, saved
   queries and ISV.config); defining other components by editing it isn't supported. That is why
   a partly packaged control points to a hand-edited zip.
