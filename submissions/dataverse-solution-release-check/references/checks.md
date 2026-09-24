@@ -19,7 +19,16 @@ already have) and **checklist** (a step a person takes before, during or after t
   `unreadable-entry`, `internal-error`.
 - **Looks for:** a zip with `solution.xml` at its root whose root element is `<ImportExportXml>`
   containing `<SolutionManifest>`, plus a `customizations.xml` whose root element is also
-  `<ImportExportXml>` (either one with another root is `not-a-solution`). It recognises the usual wrong
+  `<ImportExportXml>` (either one with another root is `not-a-solution`). The manifest must also
+  have what every export we've seen has (Learn doesn't document `solution.xml` element by
+  element): a `UniqueName`, a `Version`, `Managed` 0 or 1, a `Publisher` with a `UniqueName`
+  and `CustomizationPrefix`, and a `RootComponents` element whose components each have a
+  `type` (identifiers vary: most have a `schemaName` or `id`, some only a `parentId`, and the
+  classic site map, type 62, has none, so no identifier is required). A manifest that lacks any
+  of them is `not-a-solution`; `Managed` 2, which unpacked solution source carries, gets pack
+  advice. A
+  version or prefix that is present but breaks the documented format is a warning instead
+  (check 1). It recognises the usual wrong
   uploads: Solution checker results (a bare SARIF file, recognised by a `.sarif` name or SARIF's
   JSON shape, which is what a Managed Environments enforcement results link downloads; a zip
   holding `.sarif` files, which is what the checker web API and PowerShell module return; or a
@@ -160,7 +169,7 @@ already have) and **checklist** (a step a person takes before, during or after t
   it is reported only as `control-manifest-invalid`, with the other two places in the evidence.
 - **Manifests:** each packaged `Controls/<name>/ControlManifest.xml` is read once, before the
   form check, and reused by checks 5 and 8. It must be well-formed XML with a `<manifest>` root
-  holding a `<control>` element with the attributes Learn marks as required (`namespace`,
+  holding exactly one `<control>` element, with the attributes Learn marks as required (`namespace`,
   `constructor`, `version` and `display-name-key`), a `control-type` of `standard` or `virtual`
   if it has one, and exactly one `<resources>` element. `description-key`, `control-type` and
   `preview-image` are optional in Learn, so their absence isn't flagged. That is the shape

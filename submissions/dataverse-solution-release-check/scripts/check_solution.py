@@ -768,7 +768,59 @@ def load_solution(pkg, rep):
                            "Root element is %s; an export has %s containing %s."
                            % (v("<" + str(root.tag) + ">"), v("<ImportExportXml>"), v("<SolutionManifest>")),
                            "Export the solution again from Power Apps or with pac solution export.")
+    missing = manifest_gaps(manifest)
+    if missing:
+        detail = ("%s %s. Every export we've seen has a unique name, a version, Managed 0 or 1, a publisher "
+                  "with a unique name and customization prefix, and a %s element whose components each have "
+                  "a type." % (v("<SolutionManifest>"), "; ".join(missing), v("<RootComponents>")))
+        fix = ("Export the solution again from Power Apps or with pac solution export, and check the .zip that "
+               "export produces without editing it.")
+        if text(kid(manifest, "Managed")) == "2":
+            # Managed 2 is what SolutionPackager (pac solution unpack --packagetype Both) writes into
+            # unpacked source; exports carry 0 or 1.
+            detail += (" Managed 2 is the value unpacked solution source carries when it was unpacked as both "
+                       "managed and unmanaged, so this looks like source zipped up rather than an export.")
+            fix = ("Pack it (pac solution pack --packagetype Managed or Unmanaged) or export the solution again, "
+                   "then check that .zip.")
+        raise PackageError("not-a-solution", "solution.xml is not a complete solution manifest", detail, fix)
     return root, manifest
+
+
+def manifest_gaps(manifest):
+    """What a <SolutionManifest> lacks that every export we've seen has, as a list of phrases
+    (empty when it is complete). A present but oddly formatted version or prefix is left to
+    check_identity(), which reports it as a warning."""
+    gaps = []
+
+    def need(el, name, label):
+        child = kid(el, name)
+        if child is None:
+            gaps.append("has no %s" % v(label))
+        elif not text(child):
+            gaps.append("has no value in %s" % v(label))
+
+    need(manifest, "UniqueName", "<UniqueName>")
+    need(manifest, "Version", "<Version>")
+    managed = text(kid(manifest, "Managed"))
+    if managed not in ("0", "1"):
+        gaps.append("has %s rather than Managed 0 or 1" % (("Managed " + v(managed)) if managed else "no " + v("<Managed>")))
+    pub = kid(manifest, "Publisher")
+    if pub is None:
+        gaps.append("has no %s" % v("<Publisher>"))
+    else:
+        need(pub, "UniqueName", "<Publisher><UniqueName>")
+        need(pub, "CustomizationPrefix", "<Publisher><CustomizationPrefix>")
+    rcs = kid(manifest, "RootComponents")
+    if rcs is None:
+        gaps.append("has no %s" % v("<RootComponents>"))
+    else:
+        # Only a missing type counts as malformed. Identifiers vary: most components carry a
+        # schemaName or id, some only a parentId, and the classic site map (type 62) none at all.
+        bad = [rc for rc in kids(rcs, "RootComponent") if not attr(rc, "type")]
+        if bad:
+            gaps.append("has %d %s element%s without a type"
+                        % (len(bad), v("<RootComponent>"), "" if len(bad) == 1 else "s"))
+    return gaps
 
 
 # --------------------------------------------------------------------------- 1. summary
@@ -1120,7 +1172,7 @@ CONTROL_TYPES = ("standard", "virtual")
 
 def manifest_problem(root):
     """Why a parsed ControlManifest.xml doesn't have the shape Learn's manifest schema reference
-    gives, or "": a <manifest> root holding a <control> with the required namespace, constructor,
+    gives, or "": a <manifest> root holding exactly one <control>, with the required namespace, constructor,
     version and display-name-key attributes, a control-type (if any) of standard or virtual, and
     exactly one <resources> element."""
     if lc(root.tag) != "manifest":
@@ -1128,6 +1180,8 @@ def manifest_problem(root):
     ctrls = kids(root, "control")
     if not ctrls:
         return "%s has no %s element" % (v("<manifest>"), v("<control>"))
+    if len(ctrls) > 1:
+        return "%s has %d %s elements, not exactly one" % (v("<manifest>"), len(ctrls), v("<control>"))
     ctrl = ctrls[0]
     missing = [a for a in CONTROL_REQUIRED_ATTRS if not attr(ctrl, a)]
     if missing:
